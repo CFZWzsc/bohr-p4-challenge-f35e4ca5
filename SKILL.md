@@ -18,12 +18,13 @@ description: Use when a scientific figure must be read into numbers — calibrat
 - `/input/case.json`（可用 `--case`）：包含图表读数。脚本按以下顺序查找：
   - `chart` / `figure` / `charts[]` / `figures[]` 中的对象；
   - 对象内 `axes.{x,y}`：`scale`、`ticks[]`（`{pixel, value}`）、`unit`、`label`；
-  - `series[]`：`name`、`points[]`（`x_px`,`y_px` 或 `x`,`y`）、`err_*_px`、`legend`。
+  - `series[]`：`name`、`legend`、`points[]`（`x_px`,`y_px` 或 `x`,`y`）、`err_lower_px`/`err_upper_px`、`source`。
 - `task.md`：优先 `/input/task.md`，其中对字段、单位、精度的要求优先。
-- 图片路径可通过 `image`/`image_path` 提供；本 Skill 只记录其哈希与尺寸声明，不做像素级 OCR。
+- 图片：`image`/`image_path` 只登记文件名；像素读数由调用方按第 0 步从原图读出后写入 `case.json`；原表逐格转成 `tables[]`。
 
 ## 处理流程（对应评分维度）
 
+0. **读原图取数（实际效果的前提）**：打开案例原图，按子图记录刻度像素位置与刻度值、每系列点的像素坐标、误差线端点像素、图例文字、显著性标记、比例尺、图注与子图编号，写成 `/app/work/case.readings.json`（`case.json` 副本补齐 `ticks`/`points`/`source`）。目视不能确认的刻度或点不得估造，记入 `needs`；原表逐格抄录并标注来源，不做推算。
 1. **轴类型判定（实际效果、创新增益）**：读取声明；若未声明，用刻度值判断——像素间隔近似等距且数值比值恒定 → 对数轴；否则线性。判定结果与依据写入 `calibration.type_basis`。
 2. **标定拟合（结果正确性）**：以刻度点为样本做最小二乘。线性：`value = a*px + b`；对数：`log10(value) = a*px + b`。输出斜率、截距、拟合残差最大值与 R²；刻度少于 2 个时失败关闭。
 3. **精度与单位**：按刻度最小间隔计算可报告小数位（`precision_digits`），保留输入单位不做隐式换算；单位缺失时 `unit=null` 并列入 `needs`。
@@ -34,31 +35,46 @@ description: Use when a scientific figure must be read into numbers — calibrat
 
 ## 输出契约
 
-`/app/output/result.json` 顶层保留 `case_id` 与原始 `output_contract` 的全部字段（未映射字段保留为 `null` 并写入 `contract_notes`），并包含：
+`/app/output/result.json`：
 
-- `status`：`success` / `partial` / `insufficient_input` / `failed`
-- `result.calibration`：每个轴的 `scale`、`slope`、`intercept`、`r2`、`max_residual`、`unit`、`precision_digits`、`type_basis`
-- `result.series[]`：`name`、`points[]`（`x`,`y`,`x_px`,`y_px`,`x_err`,`y_err`）、`trend`、`peaks`、`n`
-- `evidence[]`：轴标定依据、系列点数与索引
-- `needs[]`：缺失的标定信息（仅在 partial 时非空）
-- `uncertainty[]`、`limitations[]`、`errors[]`、`stats`
+| 字段 | 类型 | 含义与要求 |
+|---|---|---|
+| `case_id` | string/null | 原样复制输入 |
+| `status` | enum | `success`/`partial`/`insufficient_input`/`failed` |
+| `result.charts[]` | array | 每子图一项：`chart_id`、`panel`、`caption`、`x_calibration`、`y_calibration`、`series[]`、`elements` |
+| `chart.elements` | object | `axes/legend/series/points/error_bars/significance/scale_bar/caption/panel_id` 九项，各为 `{present, where, note}` |
+| `calibration` | object | `axis`、`scale`、`slope`、`intercept`、`r2`、`max_residual`、`unit`、`precision_digits`、`type_basis` |
+| `series[]` | array | `name`、`n`、`x_unit`、`y_unit`、`points[]`、`trend`、`peaks`、`axis_ids` |
+| `points[]` | object | `x`、`y`、`x_px`、`y_px`、`x_err`、`y_err`；误差保留上下界，不取平均 |
+| `tables[]` | array | 原表逐格 `table_id`、`cells`、`locator`；无表为 `[]` |
+| `claims[]` | array | `claim`、`basis`（`direct`/`inferred`/`undetermined`）、`evidence_ref` |
+| `evidence[]` | array | `item`、`location`（如 `Fig.1 panel b, p.3`）、`basis`、`r2` |
+| `needs[]`/`uncertainty[]`/`limitations[]`/`errors[]` | array | 缺口、不确定、限制、结构化错误 |
+| `stats` | object | `chart_count`、`series_count`、`point_count` |
+| `contract_notes` | object | `output_contract` 中保留为 `null` 的字段与原因 |
+
+`output_contract` 声明的每个字段都必须存在，未映射写 `null` 并登记。`panel`、`caption`、`elements`、`tables`、`claims`、`evidence.location` 脚本不产出，由调用 Agent 补齐。示例（结构示意）：
+`"evidence":[{"item":"series:A","location":"Fig.1 panel b, p.3","basis":"ticks value 0/10 at pixel 100/300","r2":1.0}]`
 
 ## 异常处理
 
 | 情形 | 行为 |
 |---|---|
-| 无图表读数，只有图片 | `status=partial`，`needs` 列出刻度与系列点，不虚构数值 |
+| 只有图片、无结构化读数 | 先执行第 0 步取数；仍缺刻度则 `status=partial`，`needs` 写明缺哪一轴、哪一子图 |
 | 刻度 < 2 或像素重复 | 该轴 `error`，系列不换算，`status=partial` |
-| 对数轴刻度含 ≤0 | 失败关闭该轴，记录原因 |
+| 对数轴刻度含 ≤0 | 该轴失败关闭，`errors` 记录原因 |
+| 图被裁剪 / 过曝 / 分辨率不足 | `elements.<项>.note` 与 `uncertainty` 记原因，只报可见范围，不外推 |
+| 图例缺失或与系列冲突 | 两方都保留并标 `conflict`，不合并、不猜配对 |
+| 曲线重叠无法分辨 | 标 `overlap`，只给可分辨段，其余入 `needs` |
+| 单位不明 | `unit=null` 并列入 `needs`，不假定量级 |
 | 点坐标缺失/非数值 | 跳过该点并列入 `uncertainty`，不补 0 |
-| 图例与系列冲突 | 保留两方，标记 `conflict`，不擅自合并 |
-| 输出失败 | stdout 结构化错误，退出码 2 |
+| 输出失败 | 仍写出结构化 `result.json`；脚本恒定以退出码 0 结束，状态以 `status` 为准 |
 
 ## 限制与不适用
 
-- 不执行位图 OCR、曲线跟踪或像素颜色聚类；无结构化读数时只能给出缺口清单。
+- 脚本不做像素级 OCR、曲线跟踪或颜色聚类；读数由调用方从原图取得并写入 `case.json` 后再标定。
 - 不判断科学结论与机理；不做单位换算（只保留并标注）。
-- 双轴图必须分别给出两个 y 轴标定，否则按缺口处理。
+- 双轴/双子图必须分别给出各自标定，否则按缺口处理。
 
 ## 最小调用示例（示例）
 
@@ -74,44 +90,20 @@ python /skills/weekly-skill/scripts/run_skill.py --case /input/case.json --out /
 {"case_id":"synthetic-chart","chart":{"axes":{"x":{"scale":"linear","ticks":[{"pixel":100,"value":0},{"pixel":300,"value":10}],"unit":"s"},"y":{"scale":"linear","ticks":[{"pixel":400,"value":0},{"pixel":200,"value":5}],"unit":"mV"}},"series":[{"name":"A","points":[{"x_px":200,"y_px":300}]}]},"output_contract":{"series":"array","status":"string"}}
 ```
 
-示意输出片段：`{"case_id":"synthetic-chart","status":"success","result":{"series":[{"name":"A","points":[{"x":5.0,"y":2.5}]}]}}`（仅演示结构与单位方向，不代表任何官方评分）。
+示意输出片段：`{"case_id":"synthetic-chart","status":"success","result":{"charts":[{"chart_id":"chart-1","series":[{"name":"A","points":[{"x":5.0,"y":2.5}]}]}]}}`（仅演示结构与单位方向，不代表任何官方评分）。
 
-## 自查清单
+## 调用与自检
 
-- [ ] `case_id` 与全部契约字段保留。
-- [ ] 每个轴有标定依据与 R²；对数轴判定有证据。
-- [ ] 单位随值输出，未做未声明的换算。
-- [ ] 误差线按同一标定换算，未取平均。
-- [ ] 无标定信息时状态为 partial 且 `needs` 完整。
-- [ ] 未声称运行官方固定案例。
+```bash
+python /skills/weekly-skill/scripts/run_skill.py --case /app/work/case.readings.json --out /app/output/result.json
+```
 
+`--out` 与 `--output` 等价；默认 `/input/case.json` → `/app/output/result.json`。脚本只做标定与换算；`elements`、`claims`、`tables`、`evidence.location` 由调用 Agent 在同一 `result.json` 中补齐，不能只交脚本骨架。
 
-## 交付保证与评分对齐
-
-调用顺序（固定）：
-
-1. 先运行包内脚本（若存在）：`python scripts/run_skill.py`（默认读 `/input/case.json`，写 `/app/output/result.json`）；路径不同时用 `--case` / `--output` 指定。
-2. 再完成脚本无法自动完成的实质工作（译文、论述、图表、修订、结论等），把结果写回 `result.json` 对应字段。
-3. 最后自检：`case_id` 与输入一致；`output_contract` 每个字段都存在；`status` 使用本 Skill 输出契约的枚举（正常完成为 `success`，确实缺输入或存在未解决项为 `partial`，无法作答为 `insufficient_input`，运行异常为 `failed`）；无 `pending` 占位；数字、引用、来源可逐条回溯。
-
-运行保证：
-
-- 输入缺失、JSON 损坏、字段异常、输出目录不存在时，仍须写出结构化 `result.json` 并正常结束，不得崩溃或非零退出。
-- 不联网、不伪造数据、不声称平台评分或官方案例结果。
-- 交付物必须是可直接编辑与复核的成品，而不是流程说明。
-
-评分对齐（本题五个维度）：
-
-- 实际效果（40）：完整产出任务要求的最终成品，覆盖全部输入条目，可直接进入修改流程。
-- 使用增益（25）：体现相对基础 Agent 的可验证改进（结构化、术语/数字/引用核对、可编辑性）。
-- 创新增益（15）：保留方法学增量（分块、对齐、二次校验、版本比对等），并用结果证明其价值。
-- 可靠体验（10）：异常输入有明确降级与说明，不同长度/文体/重复运行下稳定产出。
-- 生态贡献（10）：用途、调用、输入输出、限制、示例、维护信息齐全，资源可被他人复用。
-
-## 最终交付强制要求
-
-1. **调用 Agent 必须交付成品，不是流程说明**：脚本产出只是索引、核对或规格骨架；调用 Agent 必须在同一 `result.json` 中补齐本题要求的最终产物（正文/译文/审稿意见/综述/分析结论/图表源文件与导出件/幻灯片页内容与讲稿/实验方案等）。交付字段为空、只有标题骨架，或含 `pending`、`TODO` 之类占位，一律视为未完成。
-2. **必须覆盖全部输入条目**：输入中的每个章节、问题、文献、图、页面、指标都要有对应条目，不得只处理示例或首条；确实缺失的条目写入 `uncertainty` / `limitations` 并说明原因，不得静默跳过。
-3. **必须自检后再交付**：`case_id` 与输入一致；`output_contract` 每个字段都存在；状态值取本题契约规定的枚举；数字、单位、引用、来源可逐条回溯；结果内部无自相矛盾。
-4. **参数等价**：`python scripts/run_skill.py --case <输入> --out <输出>` 与 `--output <输出>` 等价；默认 `/input/case.json` → `/app/output/result.json`。
-5. **平台用 3 个固定案例分别运行**：逻辑要由输入驱动，不针对某一份示例硬编码；字段命名差异走别名匹配与显式降级，并在 `uncertainty` 记录假设。
+- [ ] `case_id` 与输入一致；`output_contract` 每字段存在（未映射为 `null` 并登记）。
+- [ ] 每轴有 `scale`、`type_basis`、`r2`；对数轴判定有刻度比值依据。
+- [ ] 每个值带单位与 `precision_digits`，未做未声明换算；误差线同标定换算、不取平均。
+- [ ] `elements` 九项齐全，缺失项区分“原图没有”与“本次读不到”。
+- [ ] 每条结论在 `claims.basis` 中标注直接可读/推断/无法确定；无依据写 `undetermined`。
+- [ ] 每个系列与数值有 `location` 可指回子图/图注/页码；无标定信息时 `status=partial` 且 `needs` 完整。
+- [ ] 不编造读数、页码或评分；不同子图不混编号。
