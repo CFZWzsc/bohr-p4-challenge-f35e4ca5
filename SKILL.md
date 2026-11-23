@@ -1,109 +1,229 @@
 ---
-name: figure-axis-calibrator
-description: Use when a scientific figure must be read into numbers — calibrate axes from tick marks (linear or log), convert pixel positions to data values with units and precision, and emit /app/output/result.json preserving case_id and every output_contract field.
+name: bohr-reading-02
+description: 当需要解析科研材料并产出可复核的结构化结果时使用。 本题范围：阅读02｜科研图表解析。 题目家族：科研图表解析。 任务要求：本案例用于“阅读 02｜科研图表解析”。从科研图表中提取坐标、单位、数据点、图例、趋势和不确定性，无法读出的内容必须标注。 仅依据包内材料完成任务；材料未报告时明确说明，不能联网补写。 每条主要结论附 paragraph_id、原文短引文和条件；输出结构化结果并保留不确定性。 产出 result.json，其中包含运行时 output_contract 要求的全部字段，每条结论附带原文证据（段落定位 + 短引），无法从材料判断的部分如实写入 uncertainty 而非编造。
 ---
 
-# 科研图表坐标标定与数据提取
+# 阅读02｜科研图表解析
 
-## 用途与适用条件
+## 用途
 
-把一张科研图（或一组子图）的结构化读数转成带单位、带精度、可复算的数据：先由刻度标定坐标轴（线性/对数/双轴），再把像素坐标换算为数据值，输出系列表、趋势与峰位、误差线与证据定位。
+本题属于**reading** 赛道。目标能力：从真实科研材料（PDF / 文本 / 表格 / 图注）中读取事实，逐条结论都锚定到原文位置（段落 id + 原文短引），并区分'材料确实说了'与'无法从材料判断'。
 
-适用于：折线/散点/柱状/箱线图的数值化、光谱峰位读取、多子图分别标定。以下情形必须如实降级而不是编造：只有位图没有任何刻度信息、图被裁剪导致刻度缺失、图例与系列无法对应、单位未标注。此时输出 `status=partial`，在 `needs` 中列出补齐标定所需的最少信息。
+本 Skill 在 DeepSeek Harness 中被加载到 `/skills/weekly-skill`。
+Harness 会在 3 个固定科研案例上分别调用它；每个案例的输入是
+`/input/case.json`（含 `task_instruction` 与 `output_contract`）与同目录下的
+科研材料文件。
 
-本 Skill 不负责识别图中物质的科学身份，也不从曲线形状推断机理。
+## 任务要求（来自题面）
 
-## 输入
+本案例用于“阅读 02｜科研图表解析”。从科研图表中提取坐标、单位、数据点、图例、趋势和不确定性，无法读出的内容必须标注。 仅依据包内材料完成任务；材料未报告时明确说明，不能联网补写。 每条主要结论附 paragraph_id、原文短引文和条件；输出结构化结果并保留不确定性。 本次明确以organizer-supplied-scope.json中的实际图片及原表清单为必做对象；原领域旧标签更正为实际材料，不要求构造未给图片或材料外图型。
 
-- `/input/case.json`（可用 `--case`）：包含图表读数。脚本按以下顺序查找：
-  - `chart` / `figure` / `charts[]` / `figures[]` 中的对象；
-  - 对象内 `axes.{x,y}`：`scale`、`ticks[]`（`{pixel, value}`）、`unit`、`label`；
-  - `series[]`：`name`、`legend`、`points[]`（`x_px`,`y_px` 或 `x`,`y`）、`err_lower_px`/`err_upper_px`、`source`。
-- `task.md`：优先 `/input/task.md`，其中对字段、单位、精度的要求优先。
-- 图片：`image`/`image_path` 只登记文件名；像素读数由调用方按第 0 步从原图读出后写入 `case.json`；原表逐格转成 `tables[]`。
+本题可预知的契约键（来自公开样例 `example-input.json`；**实际以运行时 `/input/case.json` 为准**，下表仅供预热）：
 
-## 处理流程（对应评分维度）
+- `case_id`
+- `claims`
+- `evidence`
+- `result`
+- `status`
+- `uncertainties`
 
-0. **读原图取数（实际效果的前提）**：打开案例原图，按子图记录刻度像素位置与刻度值、每系列点的像素坐标、误差线端点像素、图例文字、显著性标记、比例尺、图注与子图编号，写成 `/app/work/case.readings.json`（`case.json` 副本补齐 `ticks`/`points`/`source`）。目视不能确认的刻度或点不得估造，记入 `needs`；原表逐格抄录并标注来源，不做推算。
-1. **轴类型判定（实际效果、创新增益）**：读取声明；若未声明，用刻度值判断——像素间隔近似等距且数值比值恒定 → 对数轴；否则线性。判定结果与依据写入 `calibration.type_basis`。
-2. **标定拟合（结果正确性）**：以刻度点为样本做最小二乘。线性：`value = a*px + b`；对数：`log10(value) = a*px + b`。输出斜率、截距、拟合残差最大值与 R²；刻度少于 2 个时失败关闭。
-3. **精度与单位**：按刻度最小间隔计算可报告小数位（`precision_digits`），保留输入单位不做隐式换算；单位缺失时 `unit=null` 并列入 `needs`。
-4. **点换算与误差线**：每个点换算为 `x`,`y`；若给出误差像素，按同一条标定换算为数据误差；范围值保持上下界，不取平均。
-5. **系列级结论**：点数、范围、最小二乘趋势斜率（含单位/像素换算）、局部峰（相邻点比较，最多 5 个）、显著性与比例尺等非数据元素只在输入显式给出时记录，不臆测。
-6. **证据定位（可核验性）**：每个系列记录 `axis_ids`、使用的刻度点、点索引范围；每条结论附 `derived_from`。
-7. **稳定性（可靠体验）**：全流程无随机；相同输入重复运行结果一致。异常输入进入结构化错误。
+## 交付物
 
-## 输出契约
+result.json（契约齐全）、evidence 索引、run-review.md
 
-`/app/output/result.json`：
+交付物的**内容契约**由运行时 `output_contract` 决定（见下）；下面「交付物落盘
+要求」给出的是必须真实存在的**文件**。
 
-| 字段 | 类型 | 含义与要求 |
-|---|---|---|
-| `case_id` | string/null | 原样复制输入 |
-| `status` | enum | `success`/`partial`/`insufficient_input`/`failed` |
-| `result.charts[]` | array | 每子图一项：`chart_id`、`panel`、`caption`、`x_calibration`、`y_calibration`、`series[]`、`elements` |
-| `chart.elements` | object | `axes/legend/series/points/error_bars/significance/scale_bar/caption/panel_id` 九项，各为 `{present, where, note}` |
-| `calibration` | object | `axis`、`scale`、`slope`、`intercept`、`r2`、`max_residual`、`unit`、`precision_digits`、`type_basis` |
-| `series[]` | array | `name`、`n`、`x_unit`、`y_unit`、`points[]`、`trend`、`peaks`、`axis_ids` |
-| `points[]` | object | `x`、`y`、`x_px`、`y_px`、`x_err`、`y_err`；误差保留上下界，不取平均 |
-| `tables[]` | array | 原表逐格 `table_id`、`cells`、`locator`；无表为 `[]` |
-| `claims[]` | array | `claim`、`basis`（`direct`/`inferred`/`undetermined`）、`evidence_ref` |
-| `evidence[]` | array | `item`、`location`（如 `Fig.1 panel b, p.3`）、`basis`、`r2` |
-| `needs[]`/`uncertainty[]`/`limitations[]`/`errors[]` | array | 缺口、不确定、限制、结构化错误 |
-| `stats` | object | `chart_count`、`series_count`、`point_count` |
-| `contract_notes` | object | `output_contract` 中保留为 `null` 的字段与原因 |
+## 执行方式
 
-`output_contract` 声明的每个字段都必须存在，未映射写 `null` 并登记。`panel`、`caption`、`elements`、`tables`、`claims`、`evidence.location` 脚本不产出，由调用 Agent 补齐。示例（结构示意）：
-`"evidence":[{"item":"series:A","location":"Fig.1 panel b, p.3","basis":"ticks value 0/10 at pixel 100/300","r2":1.0}]`
-
-## 异常处理
-
-| 情形 | 行为 |
-|---|---|
-| 只有图片、无结构化读数 | 先执行第 0 步取数；仍缺刻度则 `status=partial`，`needs` 写明缺哪一轴、哪一子图 |
-| 刻度 < 2 或像素重复 | 该轴 `error`，系列不换算，`status=partial` |
-| 对数轴刻度含 ≤0 | 该轴失败关闭，`errors` 记录原因 |
-| 图被裁剪 / 过曝 / 分辨率不足 | `elements.<项>.note` 与 `uncertainty` 记原因，只报可见范围，不外推 |
-| 图例缺失或与系列冲突 | 两方都保留并标 `conflict`，不合并、不猜配对 |
-| 曲线重叠无法分辨 | 标 `overlap`，只给可分辨段，其余入 `needs` |
-| 单位不明 | `unit=null` 并列入 `needs`，不假定量级 |
-| 点坐标缺失/非数值 | 跳过该点并列入 `uncertainty`，不补 0 |
-| 输出失败 | 仍写出结构化 `result.json`；脚本恒定以退出码 0 结束，状态以 `status` 为准 |
-
-## 限制与不适用
-
-- 脚本不做像素级 OCR、曲线跟踪或颜色聚类；读数由调用方从原图取得并写入 `case.json` 后再标定。
-- 不判断科学结论与机理；不做单位换算（只保留并标注）。
-- 双轴/双子图必须分别给出各自标定，否则按缺口处理。
-
-## 最小调用示例（示例）
-
-以下为接口示意，**非官方固定案例结果**。
+入口脚本：`scripts/sk_entry.py`。它会读取 `/input`，产出 `/app/output/result.json`。
 
 ```bash
-python /skills/weekly-skill/scripts/run_skill.py --case /input/case.json --out /app/output/result.json
+# 在案例环境中执行（Harbor 会自动调用；手动复现同一条命令）
+python /skills/weekly-skill/scripts/sk_entry.py \
+  --input /input --work /app/work --out /app/output
 ```
 
-合成输入（示例）：
+执行结束后必须存在且可解析：
+
+- `/app/output/result.json` —— 契约字段齐全的最终结果
+- `/app/output/run-review.md` —— 人类可读的证据索引与不确定性清单（复核用）
+
+### 两阶段工作流（重要：脚本只做取证，判断由你做）
+
+脚本是**确定性**的：它读材料、切段落、建证据索引、按契约键名填字段。它**不做**
+领域判断 —— 哪几条陈述才是结论、答案该怎么组织、交付物该说什么，这些必须由你
+（执行 Agent）来做。所以本 Skill 的完整用法是**跑两次**：
+
+```bash
+# 阶段 A：脚本取证，产出结果骨架 + 任务单
+python /skills/weekly-skill/scripts/sk_entry.py \
+  --input /input --work /app/work --out /app/output
+
+# 阶段 B：你读 /app/work/agent_tasks.json，写 /app/work/agent_judgement.json
+
+# 阶段 C：脚本再跑一次，把你的判断校验后合并进 result.json
+python /skills/weekly-skill/scripts/sk_entry.py \
+  --input /input --work /app/work --out /app/output
+```
+
+**阶段 A 之后**，`/app/work/agent_tasks.json` 会告诉你：
+
+| 字段 | 内容 |
+|---|---|
+| `contract_keys` / `contract_semantics` | 本案例的契约键，以及每个键该装什么 |
+| `evidence_anchors` | 全部段落 id + 原文短引（你的证据只能从这里取） |
+| `draft_claims` / `open_questions` | 脚本机械抽到的候选论断与待答问题 |
+| `what_to_judge` | 本题需要你判断的四件事 |
+| `how_to_write_the_judgement` | 判断文件的结构与规则 |
+
+**阶段 B** —— 有两种写法，**任选其一**：
+
+**(a) 写判断文件**（推荐，校验最严格）—— `/app/work/agent_judgement.json`：
 
 ```json
-{"case_id":"synthetic-chart","chart":{"axes":{"x":{"scale":"linear","ticks":[{"pixel":100,"value":0},{"pixel":300,"value":10}],"unit":"s"},"y":{"scale":"linear","ticks":[{"pixel":400,"value":0},{"pixel":200,"value":5}],"unit":"mV"}},"series":[{"name":"A","points":[{"x_px":200,"y_px":300}]}]},"output_contract":{"series":"array","status":"string"}}
+{
+  "case_id": "必须与 case.json 一致",
+  "claims": [
+    {"text": "你判断为结论的陈述",
+     "evidence": [{"paragraph_id": "P002", "quote": "原文里逐字出现的片段"}]}
+  ],
+  "answers": [
+    {"question": "被问的问题", "answer": "你的回答",
+     "evidence": [{"paragraph_id": "P002", "quote": "原文里逐字出现的片段"}]}
+  ],
+  "deliverable": "本题最终交付物的正文",
+  "contract_fields": {"契约键名": "该键的内容（可选，直接填契约键）"},
+  "uncertainties": [
+    {"kind": "machine_readable_category", "item": "具体对象",
+     "detail": "客观描述", "resolution": "你做了什么或为何无法继续"}
+  ]
+}
 ```
 
-示意输出片段：`{"case_id":"synthetic-chart","status":"success","result":{"charts":[{"chart_id":"chart-1","series":[{"name":"A","points":[{"x":5.0,"y":2.5}]}]}]}}`（仅演示结构与单位方向，不代表任何官方评分）。
+**(b) 直接写 `/app/output/result.json`** —— 也支持，脚本会把你写进去的契约键
+**取出来**（先留底，再合并），同样过引文校验。你的 `result.json` 不会被覆盖。
 
-## 调用与自检
+> 两种写法都会被采纳；**不要**两个都不做 —— 那就只剩机械抽取，`status` 停在 `partial`。
+
+**阶段 C 的校验闸门（脚本强制执行）**：
+
+- 每条 `quote` 必须能在材料原文里**逐字找回**（允许空白差异）—— 找不到就**退回**，
+  并把退回理由写进 `uncertainty`；
+- 每条 claim / answer 必须至少有一个证据锚点 —— 没有锚点的条目被退回；
+- `contract_fields` 的值不能是 `null` 或空容器 —— 空值被退回；
+- 被退回的条目**不会**进入最终结果，脚本保留自己的确定性抽取作为兜底。
+
+> 判断可以自由，**证据不可以自由**。这条闸门是本 Skill 的可信度基础。
+
+只有完成阶段 B，脚本才会把 `status` 从 `partial` 升到 `answered`；否则结果里的
+`uncertainty` 会保留一条 `judgement_pending`，如实说明"只做了机械抽取，尚未判断"。
+
+### 脚本职责
+
+| 脚本 | 职责 |
+|---|---|
+| `scripts/sk_entry.py` | 入口：定位输入、发现材料、执行 `topic.run()`、装配 `result.json`、自检并写复核产物 |
+| `scripts/sk_base.py` | 公共库：契约解析、材料发现、证据构造、结果装配、自检工具 |
+| `scripts/topic.py` | 题目逻辑：读材料 → 建证据索引 → 按契约键名语义产出字段 → 校验并合并你的判断 |
+| `scripts/specialize.py` | reading / writing 引擎：逐 `field_id` 抽取（四态状态）；可编辑稿件 + 改动记录 + 来源映射 |
+| `scripts/artifacts.py` | graphics 引擎：实体—连接—步骤 IR → 分层 SVG → 渲染 PNG + 来源记录 |
+| `scripts/pptxgen.py` | slides 引擎：stdlib-only 真实 PPTX + 逐页 SVG/PNG + 独立讲稿备注 |
+
+**这些引擎会真的写文件。** 每条赛道具体落盘哪些文件、每个文件里有什么、
+如何回挂到契约键，见 `references/artifact-pipeline.md`。
+
+### 运行时契约是唯一权威
+
+`output_contract` **只在运行时可见**（`/input/case.json`）。
+不要硬编码任何字段名，也不要凭题面示例臆造字段：
+
+1. 读取 `/input/case.json` 的 `output_contract`；
+2. 对每个契约键，按**键名语义**判断它应该承载什么（证据 / 结论 / 不确定性 /
+   交付物 / 覆盖度 / 变更记录 …）；
+3. 产出对应内容，**不允许**留下 `null` 或"未产出"占位；
+4. 若该键确实无法从材料得出，填入结构化的"无法判断"条目（带 `kind`、`item`、
+   `detail`、`resolution`），而不是留空。
+
+## 交付物落盘要求
+
+除 `result.json` 外，**可编辑的交付物源文件与其渲染预览必须真实存在**：
+
+| 赛道 | 必须落到 `/app/output` 的文件 |
+|---|---|
+| reading | `result.json`（契约齐全的结构化结果） |
+| reading | `run-review.md`（证据索引 + 不确定性清单） |
+| reading | `answers[]` / `target_fields[]`：若输入提供 `target-fields.json`，则逐 `field_id` 一项，状态取 `reported` / `not_reported` / `source_conflict` / `extraction_failed` |
+| reading | `anomaly-report.json` —— 异常自报：各状态计数、逐条异常原因、正文与表格取值冲突、每个取值的表格行列定位 |
+
+平台提供的 `office-renderer` / `pdf-render-tool` / `latex-compiler` 可用来渲染预览。
+**只有规格描述、没有真实文件，等于没交付** —— 评审要打开文件看。
+
+### 导出前合规检查（pre-export compliance）
+
+导出件落盘后，本 Skill 会**自动核对**并在 `*-export-checks.json` 里留档，
+让评审不必逐个打开文件猜：
+
+| 检查维度 | 记什么 |
+|---|---|
+| 目标格式 | 期望的 SVG / PNG / PDF 是否齐全、各自字节数、是否是**真矢量** |
+| 画布与分辨率 | 像素尺寸 → pt → mm 换算，实测 dpi，目标 dpi |
+| 字体 | 字体清单、嵌入情况、中文回退策略、是否存在方框/缺字风险 |
+| 色彩空间 | 色彩空间标注（sRGB 等）与是否有嵌入配置 |
+| 线宽 / 分层 | 线宽是否过细、图层是否可拆、图层清单 |
+| 数据一致性 | 图上出现的数值与源数据表的比对结果 |
+| 讲稿隔离 | 备注文字是否混进页面文字（逐页最大重叠片段） |
+| 人工确认 | 需人眼确认的项一律标 `pending_human_review`，**不代签** |
+
+失败的检查项会**原样保留为 fail**，不会被改写成通过；不可用的工具（如运行时
+没有矢量转换器或 LibreOffice）也如实记为 `unavailable`，不做假成功。
+
+## 质量红线
+
+- 每条 claim 都有 paragraph_id + 原文 quote
+- 数值、单位、图表号与原文一致，不做换算也不四舍五入
+- 材料未提及的内容写进 uncertainty，而不是补一个合理猜测
+- 表格里的取值给到**单元格级定位**（表 id + 行号 + 列名 + 单元格原文），不只说「表格里有」
+- 异常主动自报到 `anomaly-report.json`：状态计数、逐条原因、正文与表格取值冲突、缺失定位
+
+通用红线（违反即失分）：
+
+- **不编造**：材料没有的数字、引用、图表、方法、结论，一律不写。写不出来就进
+  `uncertainty`，并在 `status_reason` 里说明。
+- **可回溯**：每条结论必须能指回原文的段落 id 与短引；引文必须是原文片段，
+  不做改写、不做拼接。
+- **不提前交卷**：材料可能读不全。若只读到部分文件，`status` 应为 `partial`，
+  并在 `coverage.not_read` 写明未读的部分。
+- **不自评**：不要在结果里写"质量良好""得分很高"这类自评语句。
+
+## 失败与边界
+
+| 情况 | 正确处理 |
+|---|---|
+| 材料是扫描件、无文本层 | 用 `scripts/sk_base.py` 的 PDF 解析；仍无文本则 `status=unsupported` 并在 `uncertainty` 写明"无文本层" |
+| 材料是图片/图表 | 用平台提供的 `pdf-render-tool` / `ocr-tool`；OCR 结果标注为推断 |
+| 材料格式未知 | 记录文件路径与可读性，不猜测内容 |
+| 契约键无法解读 | 产出该键的结构化说明而非空值，并记录在 `uncertainty` |
+
+详见 `references/failure-modes.md` 与 `references/evidence-discipline.md`。
+
+## 自检
+
+`result.json` 写完后由 `scripts/sk_entry.py` 自动自检（结构、契约覆盖、
+证据完整性）。自检失败时以 `partial` 提交并在 `status_reason` 写明原因，
+不要伪造 `answered`。
 
 ```bash
-python /skills/weekly-skill/scripts/run_skill.py --case /app/work/case.readings.json --out /app/output/result.json
+python /skills/weekly-skill/scripts/sk_selftest.py --input /input
 ```
 
-`--out` 与 `--output` 等价；默认 `/input/case.json` → `/app/output/result.json`。脚本只做标定与换算；`elements`、`claims`、`tables`、`evidence.location` 由调用 Agent 在同一 `result.json` 中补齐，不能只交脚本骨架。
+## 参考
 
-- [ ] `case_id` 与输入一致；`output_contract` 每字段存在（未映射为 `null` 并登记）。
-- [ ] 每轴有 `scale`、`type_basis`、`r2`；对数轴判定有刻度比值依据。
-- [ ] 每个值带单位与 `precision_digits`，未做未声明换算；误差线同标定换算、不取平均。
-- [ ] `elements` 九项齐全，缺失项区分“原图没有”与“本次读不到”。
-- [ ] 每条结论在 `claims.basis` 中标注直接可读/推断/无法确定；无依据写 `undetermined`。
-- [ ] 每个系列与数值有 `location` 可指回子图/图注/页码；无标定信息时 `status=partial` 且 `needs` 完整。
-- [ ] 不编造读数、页码或评分；不同子图不混编号。
+- `references/evidence-discipline.md` —— 证据与不确定性纪律
+- `references/contract-handling.md` —— 运行时契约的读法与字段语义表
+- `references/two-phase-workflow.md` —— 两阶段工作流协议与校验闸门
+- `references/failure-modes.md` —— 常见失败模式与正确退路
+- `references/artifact-pipeline.md` —— 每条赛道真实落盘哪些文件、怎么回挂契约键
+- `assets/result-schema.md` —— `result.json` 的字段说明
+- `assets/policy.json` —— 不编造承诺与来源声明
+- `examples/demo-case/` —— 一个可离线复现的最小案例
